@@ -1,0 +1,21 @@
+import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+@dataclass
+class Settings:
+    zsxq_access_token: str
+    group_id: str
+    sqlite_db_path: str
+
+
+def get_settings() -> Settings:
+    return Settings(
+        zsxq_access_token=os.getenv("ZSXQ_ACCESS_TOKEN", ""),
+        group_id=os.getenv("GROUP_ID", ""),
+        sqlite_db_path=os.getenv("SQLITE_DB_PATH", "data/openclaw.db"),
+    )
