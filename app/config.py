@@ -11,6 +11,7 @@ class Settings:
     zsxq_access_token: str
     group_id: str
     sqlite_db_path: str
+    docs_storage_path: str
 
 
 def get_settings() -> Settings:
@@ -18,4 +19,5 @@ def get_settings() -> Settings:
         zsxq_access_token=os.getenv("ZSXQ_ACCESS_TOKEN", ""),
         group_id=os.getenv("GROUP_ID", ""),
         sqlite_db_path=os.getenv("SQLITE_DB_PATH", "data/openclaw.db"),
+        docs_storage_path=os.getenv("DOCS_STORAGE_PATH", "data/docs"),
     )

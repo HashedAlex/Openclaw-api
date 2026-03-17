@@ -7,12 +7,55 @@ from typing import Any
 
 import requests
 
+from app.services.document_ingestor import DocumentIngestor
+from app.services.sqlite_store import SQLiteStore
+
 
 class ZsxqScraper:
-    def __init__(self, access_token: str, group_id: str) -> None:
+    STRONG_PROMO_PATTERNS = (
+        r"活动预告",
+        r"限时优惠",
+        r"扫码",
+        r"加微信",
+        r"添加微信",
+        r"报名链接",
+        r"购买链接",
+        r"课程优惠",
+        r"直播预约",
+        r"海报",
+        r"推广",
+        r"赞助",
+    )
+    PROMO_PATTERNS = (
+        r"活动",
+        r"预告",
+        r"报名",
+        r"优惠",
+        r"折扣",
+        r"福利",
+        r"名额",
+        r"训练营",
+        r"直播",
+        r"公开课",
+        r"分享会",
+        r"嘉宾",
+        r"购票",
+        r"早鸟",
+        r"私聊",
+        r"咨询",
+        r"二维码",
+        r"转发",
+    )
+    URL_PATTERNS = (
+        r"https?://",
+        r"www\.",
+    )
+
+    def __init__(self, access_token: str, group_id: str | None = None) -> None:
         self.access_token = access_token
         self.group_id = group_id
         self.base_url = "https://api.zsxq.com/v2"
+        self.legacy_base_url = "https://api.zsxq.com/v1"
 
     def fetch_posts(
         self,
@@ -20,6 +63,8 @@ class ZsxqScraper:
         end_time: str | None = None,
         scope: str = "all",
     ) -> dict[str, Any]:
+        if not self.group_id:
+            raise ValueError("Missing group_id")
         params = {
             "scope": scope,
             "count": max(1, min(count, 100)),
@@ -37,6 +82,83 @@ class ZsxqScraper:
         payload = response.json()
 
         return self.clean_topics_response(payload, requested_count=params["count"])
+
+    def list_groups(
+        self,
+        count: int = 20,
+        end_time: str | None = None,
+    ) -> dict[str, Any]:
+        params = {
+            "count": max(1, min(count, 100)),
+        }
+        if end_time:
+            params["end_time"] = end_time
+
+        response: requests.Response | None = None
+        last_error: requests.HTTPError | None = None
+        for url in (f"{self.base_url}/groups", f"{self.legacy_base_url}/groups"):
+            response = requests.get(
+                url,
+                headers=self._build_headers(),
+                params=params,
+                timeout=20,
+            )
+            try:
+                response.raise_for_status()
+                payload = response.json()
+                return self.clean_groups_response(payload, requested_count=params["count"])
+            except requests.HTTPError as exc:
+                last_error = exc
+                continue
+
+        if last_error is not None:
+            raise last_error
+        raise requests.HTTPError("Failed to fetch groups", response=response)
+
+    def fetch_all_groups(
+        self,
+        page_size: int = 20,
+        max_pages: int = 10,
+    ) -> dict[str, Any]:
+        all_groups: list[dict[str, Any]] = []
+        seen_group_ids: set[Any] = set()
+        next_end_time: str | None = None
+        previous_end_time: str | None = None
+        fetched_pages = 0
+        requested_page_size = max(1, min(page_size, 100))
+
+        for _ in range(max(1, max_pages)):
+            page = self.list_groups(
+                count=requested_page_size,
+                end_time=next_end_time,
+            )
+            fetched_pages += 1
+            groups = page.get("groups") or []
+
+            for group in groups:
+                group_id = group.get("group_id")
+                if group_id in seen_group_ids:
+                    continue
+                seen_group_ids.add(group_id)
+                all_groups.append(group)
+
+            next_end_time = page.get("next_end_time")
+            if (
+                not page.get("has_more")
+                or not groups
+                or not next_end_time
+                or next_end_time == previous_end_time
+            ):
+                break
+            previous_end_time = next_end_time
+
+        return {
+            "count": len(all_groups),
+            "page_size": requested_page_size,
+            "pages_fetched": fetched_pages,
+            "next_end_time": next_end_time,
+            "groups": all_groups,
+        }
 
     def fetch_all_posts(
         self,
@@ -90,6 +212,156 @@ class ZsxqScraper:
             "topics": all_topics,
         }
 
+    def sync_group_posts(
+        self,
+        store: SQLiteStore,
+        docs_storage_path: str | None = None,
+        page_size: int = 20,
+        scope: str = "all",
+        max_pages: int = 10,
+    ) -> dict[str, Any]:
+        if not self.group_id:
+            raise ValueError("Missing group_id")
+
+        latest_marker = store.get_latest_topic_marker(self.group_id)
+        all_new_topics: list[dict[str, Any]] = []
+        next_end_time: str | None = None
+        previous_end_time: str | None = None
+        fetched_pages = 0
+        requested_page_size = max(1, min(page_size, 100))
+        hit_known_topic = False
+        latest_seen_topic: dict[str, Any] | None = None
+        filtered_topics: list[dict[str, Any]] = []
+        documents_saved = 0
+
+        for _ in range(max(1, max_pages)):
+            page = self.fetch_posts(
+                count=requested_page_size,
+                end_time=next_end_time,
+                scope=scope,
+            )
+            fetched_pages += 1
+            topics = page.get("topics") or []
+
+            for topic in topics:
+                if latest_seen_topic is None:
+                    latest_seen_topic = topic
+                if self._is_known_topic(topic, latest_marker, store):
+                    hit_known_topic = True
+                    break
+                if self._is_promotional_topic(topic):
+                    filtered_topics.append(topic)
+                    continue
+                all_new_topics.append(topic)
+
+            next_end_time = page.get("next_end_time")
+            if (
+                hit_known_topic
+                or not page.get("has_more")
+                or not topics
+                or not next_end_time
+                or next_end_time == previous_end_time
+            ):
+                break
+            previous_end_time = next_end_time
+
+        saved_count = store.upsert_topics(all_new_topics, self.group_id) if all_new_topics else 0
+        if docs_storage_path and all_new_topics:
+            ingestor = DocumentIngestor(docs_storage_path, self._build_headers())
+            documents: list[dict[str, Any]] = []
+            for topic in all_new_topics:
+                documents.extend(ingestor.ingest_topic_documents(self.group_id, topic))
+            documents_saved = store.upsert_documents(documents) if documents else 0
+        newest_topic = all_new_topics[0] if all_new_topics else None
+        latest_marker_topic = latest_seen_topic or newest_topic
+
+        if latest_marker_topic is not None:
+            store.update_group_sync_state(
+                group_id=self.group_id,
+                latest_topic_id=latest_marker_topic.get("topic_id"),
+                latest_create_time=latest_marker_topic.get("create_time"),
+                latest_create_time_iso=latest_marker_topic.get("create_time_iso"),
+            )
+        elif latest_marker is not None:
+            store.update_group_sync_state(
+                group_id=self.group_id,
+                latest_topic_id=latest_marker.get("latest_topic_id"),
+                latest_create_time=latest_marker.get("latest_create_time"),
+                latest_create_time_iso=latest_marker.get("latest_create_time_iso"),
+            )
+
+        return {
+            "group_id": self.group_id,
+            "new_topics_count": len(all_new_topics),
+            "filtered_topics_count": len(filtered_topics),
+            "saved_count": saved_count,
+            "documents_saved_count": documents_saved,
+            "pages_fetched": fetched_pages,
+            "page_size": requested_page_size,
+            "stopped_on_known_topic": hit_known_topic,
+            "latest_marker_before_sync": latest_marker,
+            "latest_marker_after_sync": (
+                {
+                    "latest_topic_id": latest_marker_topic.get("topic_id"),
+                    "latest_create_time": latest_marker_topic.get("create_time"),
+                    "latest_create_time_iso": latest_marker_topic.get("create_time_iso"),
+                }
+                if latest_marker_topic is not None
+                else latest_marker
+            ),
+        }
+
+    def sync_all_groups_posts(
+        self,
+        store: SQLiteStore,
+        docs_storage_path: str | None = None,
+        group_page_size: int = 20,
+        max_group_pages: int = 10,
+        topic_page_size: int = 20,
+        topic_max_pages: int = 10,
+        scope: str = "all",
+    ) -> dict[str, Any]:
+        groups_payload = self.fetch_all_groups(page_size=group_page_size, max_pages=max_group_pages)
+        results: list[dict[str, Any]] = []
+
+        for group in groups_payload.get("groups") or []:
+            group_id = group.get("group_id")
+            if group_id is None:
+                continue
+            group_scraper = ZsxqScraper(self.access_token, str(group_id))
+            sync_result = group_scraper.sync_group_posts(
+                store=store,
+                docs_storage_path=docs_storage_path,
+                page_size=topic_page_size,
+                scope=scope,
+                max_pages=topic_max_pages,
+            )
+            sync_result["group"] = group
+            results.append(sync_result)
+
+        return {
+            "groups_count": len(results),
+            "group_page_size": group_page_size,
+            "group_pages_fetched": groups_payload.get("pages_fetched"),
+            "topic_page_size": topic_page_size,
+            "topic_max_pages": topic_max_pages,
+            "new_topics_count": sum(item["new_topics_count"] for item in results),
+            "filtered_topics_count": sum(item["filtered_topics_count"] for item in results),
+            "saved_count": sum(item["saved_count"] for item in results),
+            "documents_saved_count": sum(item.get("documents_saved_count", 0) for item in results),
+            "results": results,
+        }
+
+    def filter_promotional_topics(self, topics: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        kept_topics: list[dict[str, Any]] = []
+        filtered_topics: list[dict[str, Any]] = []
+        for topic in topics:
+            if self._is_promotional_topic(topic):
+                filtered_topics.append(topic)
+                continue
+            kept_topics.append(topic)
+        return kept_topics, filtered_topics
+
     def _build_headers(self) -> dict[str, str]:
         return {
             "Cookie": f"zsxq_access_token={self.access_token}",
@@ -122,6 +394,32 @@ class ZsxqScraper:
             "has_more": has_more,
             "next_end_time": end_time,
             "topics": cleaned_topics,
+        }
+
+    def clean_groups_response(
+        self,
+        payload: dict[str, Any],
+        requested_count: int | None = None,
+    ) -> dict[str, Any]:
+        resp_data = payload.get("resp_data") or {}
+        groups = (
+            resp_data.get("groups")
+            or resp_data.get("joined_groups")
+            or resp_data.get("list")
+            or []
+        )
+
+        cleaned_groups = [self._normalize_group(group) for group in groups]
+        end_time = self._extract_group_end_time(cleaned_groups)
+        has_more = resp_data.get("has_more")
+        if has_more is None:
+            has_more = bool(requested_count and len(cleaned_groups) >= requested_count)
+
+        return {
+            "count": len(cleaned_groups),
+            "has_more": has_more,
+            "next_end_time": end_time,
+            "groups": cleaned_groups,
         }
 
     def _normalize_topic(self, topic: dict[str, Any]) -> dict[str, Any]:
@@ -184,6 +482,92 @@ class ZsxqScraper:
             "owner": self._normalize_user(comment.get("owner")),
             "replied_comment_id": comment.get("replied_comment_id"),
         }
+
+    def _normalize_group(self, group: dict[str, Any]) -> dict[str, Any]:
+        user_specific = group.get("user_specific") or {}
+        return {
+            "group_id": group.get("group_id"),
+            "name": group.get("name"),
+            "description": self._clean_text(
+                group.get("description") or group.get("summary") or group.get("intro") or ""
+            ),
+            "create_time": group.get("create_time"),
+            "create_time_iso": self._to_iso8601(group.get("create_time")),
+            "owner": self._normalize_user(group.get("owner")),
+            "statistics": {
+                "members_count": (
+                    group.get("members_count")
+                    or group.get("users_count")
+                    or group.get("member_num")
+                ),
+                "topics_count": group.get("topics_count"),
+            },
+            "joined": bool(
+                user_specific.get("joined")
+                if user_specific
+                else group.get("joined", True)
+            ),
+            "raw": group,
+        }
+
+    def _extract_group_end_time(self, groups: list[dict[str, Any]]) -> str | None:
+        for group in reversed(groups):
+            if group.get("create_time"):
+                return group["create_time"]
+        return None
+
+    def _is_known_topic(
+        self,
+        topic: dict[str, Any],
+        latest_marker: dict[str, Any] | None,
+        store: SQLiteStore,
+    ) -> bool:
+        topic_id = topic.get("topic_id")
+        if topic_id is not None and store.topic_exists(topic_id, self.group_id or ""):
+            return True
+
+        if latest_marker is None:
+            return False
+
+        marker_iso = latest_marker.get("latest_create_time_iso")
+        topic_iso = topic.get("create_time_iso")
+        if marker_iso and topic_iso and topic_iso < marker_iso:
+            return True
+
+        marker_topic_id = latest_marker.get("latest_topic_id")
+        return bool(
+            marker_iso
+            and topic_iso
+            and topic_iso == marker_iso
+            and marker_topic_id is not None
+            and str(topic_id) == str(marker_topic_id)
+        )
+
+    def _is_promotional_topic(self, topic: dict[str, Any]) -> bool:
+        text_parts = [
+            topic.get("text") or "",
+            topic.get("answer_text") or "",
+            ((topic.get("question") or {}).get("text")) or "",
+            ((topic.get("answer") or {}).get("text")) or "",
+        ]
+        text = "\n".join(part for part in text_parts if part).lower()
+        if not text:
+            return False
+
+        strong_hits = sum(1 for pattern in self.STRONG_PROMO_PATTERNS if re.search(pattern, text, re.IGNORECASE))
+        promo_hits = sum(1 for pattern in self.PROMO_PATTERNS if re.search(pattern, text, re.IGNORECASE))
+        url_hits = sum(1 for pattern in self.URL_PATTERNS if re.search(pattern, text, re.IGNORECASE))
+
+        has_marketing_images = len(topic.get("images") or []) >= 2
+        has_files = bool(topic.get("files"))
+
+        if strong_hits >= 1 and (promo_hits >= 2 or url_hits >= 1 or has_marketing_images or has_files):
+            return True
+        if promo_hits >= 4 and (url_hits >= 1 or has_marketing_images):
+            return True
+        if promo_hits >= 5:
+            return True
+        return False
 
     def _normalize_image(self, image: dict[str, Any]) -> dict[str, Any]:
         large = image.get("large") or {}
