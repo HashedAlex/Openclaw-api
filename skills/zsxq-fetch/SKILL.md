@@ -1,9 +1,9 @@
 ---
-name: openclaw-zsxq-assistant
+name: zsxq-fetch
 description: Use this skill when the user wants OpenClaw to sync subscribed Zhishi Xingqiu groups, inspect recent content, search downloaded documents, summarize updates, or answer questions grounded in the local OpenClaw ZSXQ API database.
 ---
 
-# OpenClaw ZSXQ Assistant
+# ZSXQ Fetch
 
 Use this skill to operate the local OpenClaw ZSXQ API as a data source for sync, summarization, and grounded Q&A.
 

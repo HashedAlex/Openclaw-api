@@ -1,0 +1,339 @@
+# zsxq_fetch
+
+`zsxq_fetch` is a small local FastAPI service for fetching content from ZhiShi XingQiu (知识星球 / ZSXQ), cleaning the API response, and optionally saving posts and attachments into a local SQLite database.
+
+It is useful when you want to:
+
+- fetch recent posts from one ZSXQ group
+- list all groups your account has joined
+- sync one group or all joined groups into SQLite
+- download attached files and extract searchable text from supported formats
+- search saved document content locally
+
+The project stores structured topic data in SQLite and downloaded files on disk, so it can be used as a lightweight local data source for later search, summarization, or automation.
+
+## What the project does
+
+This service exposes HTTP endpoints for:
+
+- listing groups available to the current ZSXQ account
+- fetching a single page of posts from a group
+- fetching multiple pages of posts
+- incrementally syncing only new posts since the last sync
+- syncing all joined groups
+- listing saved topics from SQLite
+- listing downloaded documents
+- searching extracted document text
+
+It also does some cleanup for you:
+
+- strips basic HTML from post text and comments
+- normalizes timestamps
+- filters likely promotional or event-ad topics during persistence and sync flows
+- downloads topic attachments
+- extracts text from `txt`, `md`, `csv`, `json`, `log`, `html`, `docx`, and some `pdf` files
+
+## Requirements
+
+- Python 3.10+
+- a valid ZSXQ account
+- your own `ZSXQ_ACCESS_TOKEN`
+
+## Install
+
+From the project root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Start the API:
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+Expected response:
+
+```json
+{"status":"ok","service":"openclaw-zsxq-api"}
+```
+
+## Environment variables
+
+The app reads configuration from a local `.env` file.
+
+Create `.env` in the project root:
+
+```dotenv
+ZSXQ_ACCESS_TOKEN=your_access_token_here
+GROUP_ID=your_default_group_id_here
+SQLITE_DB_PATH=data/openclaw.db
+DOCS_STORAGE_PATH=data/docs
+```
+
+### Meaning of each variable
+
+- `ZSXQ_ACCESS_TOKEN`: required. The authentication token used for ZSXQ API requests.
+- `GROUP_ID`: optional if you always pass `group_id` in the request, but required for single-group endpoints when you do not pass an override.
+- `SQLITE_DB_PATH`: optional. Defaults to `data/openclaw.db`.
+- `DOCS_STORAGE_PATH`: optional. Defaults to `data/docs`.
+
+### Notes for `.env`
+
+- Do not wrap values in extra quotes unless the value actually contains quotes.
+- Keep `.env` private. It contains account credentials.
+- If you want to sync all groups, `GROUP_ID` is not strictly required because the service can list groups from the token.
+
+## How to find `ZSXQ_ACCESS_TOKEN`
+
+This project sends requests with a cookie named `zsxq_access_token`, so the value you need is your own logged-in ZSXQ access token.
+
+The exact UI can change, but these are the practical ways to find it from your own account:
+
+### Method 1: Browser developer tools
+
+1. Log in to the ZSXQ web app in your browser.
+2. Open Developer Tools.
+3. Go to `Application` or `Storage`.
+4. Open `Cookies`.
+5. Look for a cookie named `zsxq_access_token`.
+6. Copy its value into `.env` as `ZSXQ_ACCESS_TOKEN=...`.
+
+### Method 2: Network request inspection
+
+1. Log in to the ZSXQ web app.
+2. Open Developer Tools and switch to the `Network` tab.
+3. Refresh the page or open a group.
+4. Click a request sent to a `zsxq.com` API endpoint.
+5. Inspect the request headers.
+6. Find the `Cookie` header and locate `zsxq_access_token=...`.
+7. Copy only the token value, not the full `Cookie:` prefix.
+
+### Important
+
+- Use only your own token.
+- Treat it like a password.
+- If the token stops working, log in again and refresh it in `.env`.
+
+## How to find `GROUP_ID`
+
+There are several reliable ways.
+
+### Method 1: Use the API after setting the token
+
+Once `ZSXQ_ACCESS_TOKEN` is set and the server is running:
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/groups/all"
+```
+
+This returns your joined groups. Each item includes a `group_id`.
+
+If you only want the first page:
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/groups?count=20"
+```
+
+### Method 2: Read it from the group URL or network calls
+
+When you open a group in the ZSXQ web UI, the group identifier is often visible either:
+
+- in the page URL
+- or in API requests for `/groups/<group_id>/topics`
+
+Open Developer Tools, inspect a request for group topics, and copy the numeric or string value used in the path.
+
+### Recommendation
+
+The safest workflow is:
+
+1. configure `ZSXQ_ACCESS_TOKEN`
+2. start the service
+3. call `/api/v1/groups/all`
+4. copy the `group_id` you want into `.env`
+
+## Basic usage
+
+### 1. Fetch one page of posts from the default group
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/fetch_posts?count=20"
+```
+
+### 2. Fetch one page of posts from a specific group
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/fetch_posts?group_id=123456789&count=20"
+```
+
+### 3. Fetch multiple pages from one group
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/fetch_all_posts?page_size=20&max_pages=5"
+```
+
+### 4. Fetch and persist posts into SQLite
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/fetch_posts?count=20&persist=true"
+```
+
+When `persist=true`, the service:
+
+- filters likely promotional topics before saving
+- writes kept topics into SQLite
+- downloads attached files for those topics
+- extracts text when supported
+- stores document metadata in SQLite
+
+### 5. Incrementally sync only new posts from one group
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/sync_group_posts?page_size=20&max_pages=10"
+```
+
+This is usually the most practical endpoint for regular use. It checks the local sync marker and stops when it reaches already-known content.
+
+### 6. Sync all joined groups
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/sync_all_groups_posts"
+```
+
+### 7. Read saved topics from SQLite through the API
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/topics?limit=50&offset=0"
+```
+
+### 8. List saved documents
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/documents?group_id=123456789&limit=50"
+```
+
+### 9. Search extracted document text
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/search_documents?q=keyword&group_id=123456789"
+```
+
+## Recommended first-time setup flow
+
+1. Create and activate the virtual environment.
+2. Install dependencies with `pip install -r requirements.txt`.
+3. Find your `ZSXQ_ACCESS_TOKEN`.
+4. Start the server.
+5. Call `/api/v1/groups/all` to discover available groups.
+6. Put your preferred `GROUP_ID` into `.env`.
+7. Run `/api/v1/sync_group_posts` for the first sync.
+8. Use `/api/v1/topics`, `/api/v1/documents`, and `/api/v1/search_documents` to inspect the saved data.
+
+## API summary
+
+### Health
+
+- `GET /health`
+
+### Remote fetch endpoints
+
+- `GET /api/v1/groups`
+- `GET /api/v1/groups/all`
+- `POST /api/v1/fetch_posts`
+- `POST /api/v1/fetch_all_posts`
+
+### Sync endpoints
+
+- `POST /api/v1/sync_group_posts`
+- `POST /api/v1/sync_all_groups_posts`
+
+### Local data endpoints
+
+- `GET /api/v1/topics`
+- `GET /api/v1/documents`
+- `GET /api/v1/search_documents`
+
+## Where data is stored
+
+By default:
+
+- SQLite database: `data/openclaw.db`
+- downloaded files: `data/docs/`
+
+The app creates these directories automatically if they do not exist.
+
+## Document extraction behavior
+
+The service can extract text from:
+
+- plain text files such as `txt`, `md`, `csv`, `json`, `log`
+- `html` and `htm`
+- `docx`
+- some `pdf` files through `pypdf`
+
+If a file type is not supported, it is still downloaded, but text extraction may be skipped.
+
+## Testing
+
+Run tests with:
+
+```bash
+python -m unittest discover -s tests
+```
+
+## Common issues
+
+### `Missing ZSXQ_ACCESS_TOKEN`
+
+Your `.env` is missing the token, or the server was started before the `.env` value was added.
+
+### `Missing GROUP_ID`
+
+You called a single-group endpoint without either:
+
+- setting `GROUP_ID` in `.env`
+- or passing `group_id=...` in the request
+
+### Empty results
+
+Possible causes:
+
+- the token is expired
+- the selected group has no recent posts
+- the group ID is wrong
+- the account tied to the token does not have access to that group
+
+### Attachments downloaded but not searchable
+
+That usually means the file type is unsupported or PDF extraction could not extract text.
+
+## Security notes
+
+- Never commit `.env`.
+- Never share `ZSXQ_ACCESS_TOKEN`.
+- Prefer creating a separate local environment for this project.
+
+## Project structure
+
+```text
+app/
+  main.py                    FastAPI routes
+  config.py                  .env loading
+  services/
+    zsxq_scraper.py          ZSXQ API client and sync logic
+    sqlite_store.py          SQLite persistence
+    document_ingestor.py     attachment download and text extraction
+tests/
+requirements.txt
+Readme
+```
